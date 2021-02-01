@@ -1,4 +1,4 @@
-port pandas as pd
+import pandas as pd
 import numpy as np
 import datetime as dt
 import yfinance as yf
@@ -20,7 +20,7 @@ class backtesting_crossover:
         self.positions()
         self.returns()
         
-        
+    #Ticker should be of Yahoo Finanace    
     def fetch_data(self):
         self.df = yf.download(self.ticker, self.start_date, self.end_date)
         
@@ -60,3 +60,8 @@ class backtesting_crossover:
 
         # general analytics
         pf.create_simple_tear_sheet(self.df['strategy_returns'])
+        
+ # performance of this strategy in the broad based index (Nifty 50) over the same timeframe when ma_short=10 and ma_long=20
+nifty_10_20 = backtesting_crossover('^NSEI', start1, end1, 10, 20)
+
+## We have an inherent issue with this strategy that it has look ahead bias as we are buying a long or a short as soon as the indicator suggests where as in real life there is a delay with the same
