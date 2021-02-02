@@ -1,0 +1,253 @@
+import pandas as pd
+import numpy as np
+%matplotlib inline
+%load_ext autoreload
+%autoreload 2
+import matplotlib.pyplot as plt
+plt.rcParams["figure.figsize"] = (15,5)
+plt.rcParams['axes.grid'] = False
+import seaborn as sns
+sns.set_style("whitegrid", {'axes.grid' : False})
+from IPython.core.display import display, HTML
+display(HTML("<style>.container { width:100% !important; }</style>"))
+from IPython.core.interactiveshell import InteractiveShell
+InteractiveShell.ast_node_interactivity = "all"
+from IPython.display import HTML
+from pandas.plotting import register_matplotlib_converters
+register_matplotlib_converters()
+class CROSSOVER:
+    moving_average = ("Simple","exponential") 
+    metrics = {'Sharpe':'Sharpe Ratio',
+               'CAGR':'Compound Average Growth Rate',
+               'MDD':'Maximum Drawdown',
+               'NHR':'Normalized Hit Ratio',
+               'OTS':'Optimal trade size'}
+    
+    def __init__(self,data,short_window = 5, long_window = 40,
+                 moving_average = "Simple", data_name = None, start = None,end = None ):
+
+        """
+         Doc string of the class. We define what class is about here
+        """
+        self.data=data #the dataframe
+        self.data['yr'] = self.data['Date'].dt.year
+        self.moving_average = moving_average
+        if data_name is None:#the name that will appear on plots
+            self.data_name = moving_average
+        else:
+            self.data_name=data_name
+        self.short_window = short_window
+        self.long_window = long_window
+        self.n_days = (self.data.Date.iloc[-1] - self.data.Date.iloc[0])
+        self.start=start #the beginning date of the sample period
+        self.end=end #the ending date of the sample period
+
+    def generate_signals(self, charts=True, burn=False):
+        """
+        This is an instance method. Only works on an object.
+        """
+        if self.long_window <= self.short_window: return
+
+        if self.moving_average == "Simple":
+            self.data["SMA"] = self.data.Close.rolling(self.short_window).mean()
+            self.data["LMA"] = self.data.Close.rolling(self.long_window).mean()
+        elif self.moving_average == "exponential":
+            self.data["SMA"] = self.data.Close.ewm(span = self.short_window, adjust=True).mean()
+            self.data["LMA"] = self.data.Close.ewm(span = self.long_window, adjust=True).mean()
+        else:
+            raise Exception("Not a valid type")
+
+        self.data["_lag1_SMA"] = self.data.SMA.shift(1)
+        self.data["_lag1_LMA"] = self.data.LMA.shift(1)
+
+        ## creating signal    
+        buy_mask = (self.data.SMA > self.data.LMA) & (self.data._lag1_SMA < self.data._lag1_LMA)
+        sell_mask = (self.data.SMA < self.data.LMA) & (self.data._lag1_SMA > self.data._lag1_LMA)
+
+        self.data['signal'] = np.nan
+        self.data.loc[buy_mask,'signal'] = +1
+        self.data.loc[sell_mask,'signal'] = -1
+        if burn:
+            burn_period = 2*self.long_window
+            self.data.loc[:burn_period,"signal"] = np.nan
+        self.data.signal = self.data.signal.fillna(method="ffill")
+
+        mask = (self.data.signal != self.data.signal.shift(1)) & (self.data.signal.notnull())
+        self.data['trade_num'] = np.where(mask,1,0).cumsum()
+
+        ## display chart
+        if charts:
+            plt.plot(self.data['Date'],self.data['SMA'],color='black', label=f'SMA ={self.short_window}')
+            plt.plot(self.data['Date'],self.data['LMA'],color='blue', label=f'LMA ={self.long_window}')
+            plt.title('%s Strategy Backtest'%(self.data_name))
+            plt.legend(loc=0)
+            d_color = {}
+            d_color[1] = '#90ee90'  ## light green
+            d_color[-1] = "#ffcccb" ## light red
+
+            j = 0
+            for i in range(1,self.data.shape[0]):
+                if np.isnan(self.data.signal[i-1]):
+                    j=i
+                elif (self.data.signal[i-1] == self.data.signal[i]) and (i< (self.data.shape[0]-1)):
+                    continue
+                else:
+                    plt.axvspan(self.data['Date'][j], self.data['Date'][i], 
+                               alpha=0.5, color=d_color[self.data.signal[i-1]], label="interval")
+                    j = i
+            plt.show()
+        
+    def signal_performance(self, allocation):
+        """
+        Another instance method
+        """
+        if self.long_window <= self.short_window: return
+        self.allocation=allocation
+
+        #creating returns and portfolio value series
+        self.data['Return']=np.log(self.data['Close']/self.data['Close'].shift(1))
+        self.data['S_Return']=self.data['signal'].shift(1)*self.data['Return']
+        self.data['Market_Return']=self.data['Return'].expanding().sum()
+        self.data['Strategy_Return']=self.data['S_Return'].expanding().sum()
+        self.data['Portfolio Value']=((self.data['Strategy_Return']+1)*self.allocation)
+        self.data['Wins']=np.where(self.data['S_Return'] > 0,1,0)
+        self.data['Losses']=np.where(self.data['S_Return']<0,1,0)
+
+        ## Daywise Performance
+        d_perform = {}
+        d_perform['TotalWins']=self.data['Wins'].sum()
+        d_perform['TotalLosses']=self.data['Losses'].sum()
+        d_perform['TotalTrades']=d_perform['TotalWins']+d_perform['TotalLosses']
+        d_perform['HitRatio']=round(d_perform['TotalWins']/d_perform['TotalTrades'],2)
+        d_perform['SharpeRatio'] = self.data["S_Return"].mean() / self.data["S_Return"].std() * (252**.5)        
+        d_perform['CAGR'] = (1+self.data['Strategy_Return']).iloc[-1]**(365.25/self.n_days.days) -1
+        d_perform['MaxDrawdown']=(1.0-self.data['Portfolio Value']/self.data['Portfolio Value'].cummax()).max()
+        self.daywise_performance = pd.Series(d_perform)
+
+        ## Tradewise performance
+        _df = self.data.groupby(["signal","trade_num"]).S_Return.sum().reset_index()
+        _df['Wins']=np.where(_df['S_Return'] > 0,1,0)
+        _df['Losses']=np.where(_df['S_Return']<0,1,0)
+        d_tp = {}
+        d_tp.update(_df[["Wins","Losses"]].sum().rename({'Wins':'TotalWins','Losses':'TotalLosses'}).to_dict())
+        d_tp['TotalTrades'] = d_tp["TotalWins"] + d_tp["TotalLosses"]
+        d_tp['HitRatio'] =  np.round(d_tp["TotalWins"] / d_tp['TotalTrades'],4)
+        d_tp['AvgWinRet'] = np.round(_df[_df.Wins==1].S_Return.mean(),4)
+        d_tp['AvgLossRet'] = np.round(_df[_df.Losses==1].S_Return.mean(),4)
+        d_tp['WinByLossRet'] = np.round(abs(d_tp['AvgWinRet']/d_tp['AvgLossRet']),2)
+        d_tp['RetVar'] = np.round(_df.S_Return.std(),4)
+        _sum = _df.groupby("Wins").S_Return.sum()
+        d_tp['NormHitRatio'] = np.round(_sum[1]/_sum.abs().sum(),4)
+        d_tp['OptimalTradeSize'] = self.kelly(p = d_tp['HitRatio'], b = d_tp['WinByLossRet'])
+        self.tradewise_performance = pd.Series(d_tp)
+
+    @staticmethod
+    def kelly(p,b):
+        """
+        Static method: No object or class related arguments
+        p: win prob, b: net odds received on wager, output(f*) = p - (1-p)/b
+
+        Spreadsheet example
+            from sympy import symbols, solve, diff
+            x = symbols('x')
+            y = (1+3.3*x)**37 *(1-x)**63
+            solve(diff(y, x), x)[1]
+        Shortcut
+            .37 - 0.63/3.3
+        """
+        return np.round(p - (1-p)/b,4)
+
+    def plot_performance(self, allocation=1):
+        #intializing a variable for initial allocation
+        #to be used to create equity curve
+        self.signal_performance(allocation)
+        
+        #yearly performance
+        self.yearly_performance()
+        
+        #Plotting the Performance of the strategy
+        plt.plot(self.data['Date'],self.data['Market_Return'],color='black', label='Market Returns')
+        plt.plot(self.data['Date'],self.data['Strategy_Return'],color='blue', label= 'Strategy Returns')
+        plt.title('%s Strategy Backtest'%(self.data_name))
+        plt.legend(loc=0)
+        plt.tight_layout()
+        plt.show()
+
+        plt.plot(self.data['Date'],self.data['Portfolio Value'], color='blue')
+        plt.title('%s Portfolio Value'%(self.data_name))
+        plt.show()
+        
+    def yearly_performance(self):
+        """
+        Instance method
+        Adds an instance attribute: yearly_df
+        """
+        _yearly_df = self.data.groupby(['yr','signal']).S_Return.sum().unstack()
+        _yearly_df.rename(columns={-1.0:'Sell',1.0:'Buy'}, inplace=True)
+        _yearly_df['Return'] = _yearly_df.sum(1)
+
+        # yearly_df
+        self.yearly_df = _yearly_df.style.bar(color=["#ffcccb",'#90ee90'], align = 'zero').format({
+            'Sell': '{:,.2%}'.format,'Buy': '{:,.2%}'.format,'Return': '{:,.2%}'.format})
+    
+    def update_metrics(self):
+        """
+        Called from the SMA_LMA_matrix class method
+        """
+        d_field = {}
+        if self.long_window > self.short_window:
+            d_field['Sharpe'] = self.daywise_performance.SharpeRatio
+            d_field['CAGR'] = self.daywise_performance.CAGR
+            d_field['MDD'] = self.daywise_performance.MaxDrawdown
+            d_field['NHR'] = self.tradewise_performance.NormHitRatio
+            d_field['OTS'] = self.tradewise_performance.OptimalTradeSize
+            
+        return d_field
+    
+    @classmethod
+    def SMA_LMA_matrix(cls,data, LMA_range, SMA_range, metrics, moving_average = "Simple", optimal_sol = True):
+        """
+        This is a class method. First argument is a class.
+        """
+        c_green = sns.light_palette("green", as_cmap=True)
+        c_red = sns.light_palette("red", as_cmap=True)
+        
+        d_mats = {m:[] for m in metrics}
+        
+        for l in LMA_range:
+            d_row = {m:[] for m in metrics}
+            for s in SMA_range:
+                obj = cls(data, s, l, moving_average) ## object being created from the class
+                obj.generate_signals(charts=False)
+                obj.signal_performance(100)
+                d_field = obj.update_metrics()
+                for m in metrics: d_row[m].append(d_field.get(m,np.nan))
+            for m in metrics: d_mats[m].append(d_row[m])
+                
+        d_df = {m:pd.DataFrame(d_mats[m], index=LMA_range, columns=SMA_range) for m in metrics}
+
+        def optimal(_df):
+            """ 
+            This is a function inside a function.
+            We could have created it outside the class if needed, but that would made it harder to relate. 
+            """
+            _df = _df.stack().rank()
+            _df = (_df - _df.mean())/_df.std()
+            return _df.unstack()
+
+        if optimal_sol:
+            d_df['Signal'] = 0
+            if 'Sharpe' in metrics: d_df['Signal'] += 2*optimal(d_df['Sharpe'])
+            if 'NHR' in metrics: d_df['Signal'] += optimal(d_df['NHR'])
+            if 'CAGR' in metrics: d_df['Signal'] += optimal(d_df['CAGR'])
+            if 'MDD' in metrics: d_df['Signal'] -= 2*optimal(d_df['MDD'])
+            l_i,s_i = np.unravel_index(np.argmax(d_df['Signal'].values), d_df['Signal'].shape)
+            print(f"Most optimal cross-over pair is SMA:{SMA_range[s_i]}, LMA:{LMA_range[l_i]}")
+            metrics.insert(0,'Signal')
+
+        for m in metrics:
+            display(HTML(d_df[m].style.background_gradient(axis=None, cmap=
+                c_red if m=="MDD" else c_green).format(
+                ("{:,.2}" if m in ["Sharpe","Signal"] else "{:.2%}")).set_caption(m).render()))
+            
+        return d_df
